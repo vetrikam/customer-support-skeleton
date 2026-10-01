@@ -1,6 +1,7 @@
 """Tool implementations.
 
-Two are written for you, as worked examples of the conventions. Two are stubs.
+get_customer and lookup_order are the skeleton's worked examples; process_refund
+and escalate_to_human follow the same conventions.
 
 CONVENTIONS THE WORKED EXAMPLES FOLLOW, AND YOURS SHOULD TOO
 
@@ -16,6 +17,7 @@ CONVENTIONS THE WORKED EXAMPLES FOLLOW, AND YOURS SHOULD TOO
 
 from __future__ import annotations
 
+import os
 import re
 
 from . import backend
@@ -110,29 +112,166 @@ def lookup_order(session: Session, order_id: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# YOUR TURN
+# FAIL_MODE: deterministic demo of the four error categories
+# ---------------------------------------------------------------------------
+# Set FAIL_MODE=transient|validation|business|permission before a live run and the
+# FIRST process_refund call in that session returns that category instead of
+# running. The point is to watch the agent do something different for each:
+#
+#   transient   retries the identical call, which then succeeds
+#   validation  fixes its own argument (a vaguer reason) and calls again
+#   business    stops, explains to the customer, escalates; does not retry
+#   permission  re-verifies with get_customer, then retries
+FAIL_MODES = (TRANSIENT, VALIDATION, BUSINESS, PERMISSION)
+
+
+def _injected_failure(session: Session, tool: str) -> dict | None:
+    mode = os.environ.get("FAIL_MODE", "").strip().lower()
+    if mode not in FAIL_MODES or tool in session.injected_failures:
+        return None
+    session.injected_failures.add(tool)
+    session.log(event="injected_failure", tool=tool, category=mode)
+    if mode == TRANSIENT:
+        return fail(
+            TRANSIENT,
+            "The payment processor did not respond in time. This is temporary - retry "
+            "this call once with the same arguments.",
+        )
+    if mode == VALIDATION:
+        return fail(
+            VALIDATION,
+            "Finance rejected the reason as too vague to audit. Rewrite `reason` as one "
+            "sentence naming the item and the specific defect, then call again.",
+        )
+    if mode == BUSINESS:
+        return fail(
+            BUSINESS,
+            "Refunds to this customer's original payment method are on hold because the "
+            "card was reissued, so this refund cannot be sent automatically. A "
+            "specialist can issue it to the new card. Do not retry; escalate with "
+            "reason_code 'policy_exception'.",
+        )
+    # PERMISSION: the verification has expired, so the gate will block until the
+    # customer is verified again. The session flag is what the gate reads.
+    session.verified_customer_id = None
+    return fail(
+        PERMISSION,
+        "The customer's verification expired before the refund could be authorised. "
+        "Call get_customer with their email again, then retry the refund.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# process_refund
 # ---------------------------------------------------------------------------
 def process_refund(
     session: Session, order_id: str = "", amount_usd: float = 0.0, reason: str = ""
 ) -> dict:
-    """TODO (Task 3): implement.
+    """Order-level business policy. Identity, ownership and the $500 ceiling have
+    already been enforced by enforcement.intercept() before this runs."""
+    injected = _injected_failure(session, "process_refund")
+    if injected:
+        return injected
 
-    By the time this function runs, enforcement.intercept() has already had its
-    say, so identity and the ceiling are somebody else's problem. What is left is
-    order-level business policy. At minimum:
+    order_id = str(order_id or "").strip().upper()
+    if not ORDER_ID_RE.match(order_id):
+        return fail(
+            VALIDATION,
+            f"'{order_id}' is not a valid order ID. Use the 'ORD-123' form from "
+            "lookup_order.",
+        )
+    order = backend.get_order(order_id)
+    if order is None:
+        return fail(VALIDATION, f"No order {order_id} exists.")
 
-      - unknown order                     -> validation
-      - a `reason` too thin for finance   -> validation
-      - order not delivered yet           -> business
-      - return window closed              -> business (backend.RETURN_WINDOW_DAYS)
-      - amount above what is still owed   -> business
+    # Defensive: the gate checks this too, but a handler must not trust its caller.
+    if (
+        isinstance(amount_usd, bool)
+        or not isinstance(amount_usd, (int, float))
+        or amount_usd <= 0
+    ):
+        return fail(VALIDATION, f"amount_usd must be a positive number; got {amount_usd!r}.")
+    amount = round(float(amount_usd), 2)
 
-    On success: record the refund against the session (see Session.refunded_by_order,
-    your ceiling depends on it), mint an ID with session.next_refund_id(), log it
-    with session.log(event="refund", ...), and return a LEAN result. Ask yourself
-    which fields the agent will actually read out to the customer.
-    """
-    raise NotImplementedError("process_refund: see Task 3 in the README")
+    reason = str(reason or "").strip()
+    if len(reason) < 15 or len(reason.split()) < 4:
+        return fail(
+            VALIDATION,
+            f"The reason '{reason}' is too thin for finance to audit. Describe the item "
+            "and the specific defect in one sentence, e.g. 'Kettle arrived with a cracked "
+            "spout that leaks'.",
+        )
+
+    if order["status"] != "delivered":
+        return fail(
+            BUSINESS,
+            f"Order {order_id} has not been delivered yet (status: {order['status']}), "
+            "so it cannot be refunded. Once it arrives, the customer can request a return "
+            f"within {backend.RETURN_WINDOW_DAYS} days.",
+        )
+    if not backend.return_window_open(order):
+        return fail(
+            BUSINESS,
+            f"Order {order_id} was delivered {order['days_since_delivery']} days ago, "
+            f"outside our {backend.RETURN_WINDOW_DAYS}-day return window, so it cannot be "
+            "refunded automatically. A specialist can review it as an exception: "
+            "escalate with reason_code 'policy_exception'.",
+        )
+
+    refunded_so_far = round(
+        float(order.get("already_refunded") or 0.0)
+        + session.refunded_by_order.get(order_id, 0.0),
+        2,
+    )
+    still_owed = round(order["total"] - refunded_so_far, 2)
+    if amount > still_owed:
+        return fail(
+            BUSINESS,
+            f"The most that can be refunded on {order_id} is ${still_owed:.2f} (order "
+            f"total ${order['total']:.2f}, already refunded ${refunded_so_far:.2f}). "
+            f"${amount:.2f} is more than that.",
+        )
+
+    # Success: record against the session FIRST - the ceiling depends on it.
+    session.refunded_by_order[order_id] = round(
+        session.refunded_by_order.get(order_id, 0.0) + amount, 2
+    )
+    refund_id = session.next_refund_id()
+    session.log(
+        event="refund",
+        refund_id=refund_id,
+        order_id=order_id,
+        amount_usd=amount,
+        customer_id=session.verified_customer_id,
+        reason=reason,
+    )
+    # Lean: exactly what the agent reads to the customer. No processor IDs, no
+    # timestamps, no echo of the reason it just sent.
+    return ok(
+        refund_id=refund_id,
+        order_id=order_id,
+        amount_usd=amount,
+        settles_in_days=SETTLEMENT_DAYS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# escalate_to_human
+# ---------------------------------------------------------------------------
+QUEUE_BY_REASON = {
+    "over_refund_ceiling": "refund-approvals",
+    "policy_exception": "refund-approvals",
+    "suspected_fraud": "trust-and-safety",
+    "customer_requested_human": "customer-care",
+    "unresolvable": "customer-care",
+}
+ORDER_REASONS = {"over_refund_ceiling", "policy_exception"}
+MIN_SUMMARY_CHARS = 40
+
+
+def _too_thin(text: str, min_chars: int, min_words: int) -> bool:
+    text = str(text or "").strip()
+    return len(text) < min_chars or len(text.split()) < min_words
 
 
 def escalate_to_human(
@@ -145,25 +284,139 @@ def escalate_to_human(
     order_id: str | None = None,
     amount_usd: float | None = None,
 ) -> dict:
-    """TODO (Task 6): implement.
+    """Never identity-gated. Stores a FAT ticket a human can act on without the
+    transcript; returns a LEAN result the agent reads to the customer."""
+    if reason_code not in REASON_CODES:
+        return fail(
+            VALIDATION,
+            f"reason_code must be one of {', '.join(REASON_CODES)}; got {reason_code!r}.",
+        )
 
-    Two things make this one interesting.
+    requested_human = reason_code == "customer_requested_human"
+    # A customer asking for a person is honoured immediately, so the bar is lower:
+    # a clear summary is enough. Every other ticket must stand on its own.
+    min_chars, min_words = (20, 4) if requested_human else (MIN_SUMMARY_CHARS, 6)
+    if _too_thin(issue_summary, min_chars, min_words):
+        return fail(
+            VALIDATION,
+            "issue_summary is too thin for a human who cannot see this conversation. "
+            "Write 2-3 sentences: who the customer is, which order and item, what "
+            "happened, and what they want.",
+        )
+    if not requested_human:
+        missing = [
+            name
+            for name, value in (
+                ("root_cause", root_cause),
+                ("recommended_action", recommended_action),
+            )
+            if _too_thin(value, 15, 3)
+        ]
+        if missing:
+            return fail(
+                VALIDATION,
+                f"{' and '.join(missing)} missing or too thin. State why you could not "
+                "resolve this (cite the rule or failure) and the concrete next step for "
+                "the human.",
+            )
 
-    First, it must NOT be identity-gated. "I want a human" has to be honoured
-    immediately, including from a caller who never verified. Decide what you put
-    in customer_id in that case, and say so in the tool description.
+    order_id = str(order_id).strip().upper() if order_id else None
+    if reason_code in ORDER_REASONS:
+        if not order_id:
+            return fail(VALIDATION, f"order_id is required for reason_code '{reason_code}'.")
+        if (
+            amount_usd is None
+            or isinstance(amount_usd, bool)
+            or not isinstance(amount_usd, (int, float))
+            or amount_usd <= 0
+        ):
+            return fail(
+                VALIDATION,
+                f"amount_usd (a positive number) is required for reason_code '{reason_code}'.",
+            )
 
-    Second, the human who opens this ticket cannot see the conversation. So the
-    TICKET you store on session.tickets should be fat: customer, order, amount,
-    what went wrong, why, what you recommend, and whether identity was verified.
-    Reject a ticket whose summary is a stub, with a validation error.
+    # Identity comes from SESSION STATE, never from what the model passed in.
+    verified_id = session.verified_customer_id
+    customer = next(
+        (c for c in backend.CUSTOMERS.values() if c["customer_id"] == verified_id), None
+    )
+    ticket_customer = {
+        "customer_id": verified_id or "UNVERIFIED",
+        "identity_verified": verified_id is not None,
+        "name": customer["name"] if customer else None,
+        "email": customer["email"] if customer else None,
+        "tier": customer["tier"] if customer else None,
+    }
+    if not verified_id and customer_id and customer_id.upper() != "UNVERIFIED":
+        ticket_customer["claimed_customer_id"] = customer_id
 
-    But the RESULT you hand back to the model does not need any of that. The agent
-    is about to read the customer a ticket number and a response time. Think about
-    what that means for how much of the ticket belongs in the return value, and
-    keep the answer for reflection question 3.
-    """
-    raise NotImplementedError("escalate_to_human: see Task 6 in the README")
+    # Order facts come from the backend (system of record), and only if the order
+    # belongs to the verified customer.
+    ticket_order = None
+    if order_id:
+        order = backend.get_order(order_id)
+        if order is not None and verified_id and order["customer_id"] == verified_id:
+            ticket_order = {
+                "order_id": order["order_id"],
+                "item": order["item"],
+                "total_usd": order["total"],
+                "status": order["status"],
+                "days_since_delivery": order["days_since_delivery"],
+                "return_window_open": backend.return_window_open(order),
+                "refunded_before_this_session_usd": order["already_refunded"],
+                "refunded_this_session_usd": session.refunded_by_order.get(order_id, 0.0),
+            }
+            if order.get("carrier_note"):
+                ticket_order["carrier_note"] = order["carrier_note"]
+        else:
+            ticket_order = {"order_id": order_id, "note": "Not verified against this customer."}
+
+    # Idempotent: a retry of the same escalation returns the same ticket.
+    for existing in session.tickets:
+        same_order = (existing.get("order") or {}).get("order_id") == order_id
+        if existing["reason_code"] == reason_code and same_order:
+            return ok(
+                ticket_id=existing["ticket_id"],
+                queue=existing["queue"],
+                response_within_hours=existing["response_within_hours"],
+            )
+
+    queue = QUEUE_BY_REASON[reason_code]
+    ticket = {
+        "ticket_id": session.next_ticket_id(),
+        "created_at": session.now,
+        "queue": queue,
+        "priority": (
+            "high" if reason_code in {"suspected_fraud", "over_refund_ceiling"} else "normal"
+        ),
+        "response_within_hours": ESCALATION_SLA_HOURS,
+        "reason_code": reason_code,
+        "customer": ticket_customer,
+        "order": ticket_order,
+        "amount_in_dispute_usd": (
+            round(float(amount_usd), 2)
+            if isinstance(amount_usd, (int, float)) and not isinstance(amount_usd, bool)
+            else None
+        ),
+        "issue_summary": str(issue_summary).strip(),
+        "root_cause": str(root_cause or "").strip() or None,
+        "recommended_action": str(recommended_action or "").strip() or None,
+        "refunds_issued_this_session": dict(session.refunded_by_order),
+    }
+    session.tickets.append(ticket)
+    session.log(
+        event="escalation",
+        ticket_id=ticket["ticket_id"],
+        reason_code=reason_code,
+        customer_id=ticket_customer["customer_id"],
+        order_id=order_id,
+    )
+    # Lean: the agent only needs to tell the customer a ticket number and a time.
+    return ok(
+        ticket_id=ticket["ticket_id"],
+        queue=queue,
+        response_within_hours=ESCALATION_SLA_HOURS,
+    )
 
 
 HANDLERS = {

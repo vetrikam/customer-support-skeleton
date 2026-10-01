@@ -4,6 +4,10 @@
     python run.py --demo                     # no API key needed, checks the wiring
     python run.py --live -m "your message"   # the real Messages API
     python run.py --live --scenario happy    # one of the canned customer messages
+    FAIL_MODE=business python run.py --live --scenario happy
+                                             # inject one error category into the first
+                                             # process_refund call (transient |
+                                             # validation | business | permission)
 
 Your two submitted transcripts should come from --live. The transcripts land in
 transcripts/ as markdown.
@@ -12,10 +16,11 @@ transcripts/ as markdown.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import sys
 
-from agent.loop import run_agent
+from agent.loop import LoopError, Result, run_agent
 from agent.model import LiveModel, ScriptedModel
 from agent.session import Session
 from agent.transcript import TranscriptRecorder
@@ -103,6 +108,9 @@ def main() -> int:
         model = LiveModel()
         message = args.message or SCENARIOS.get(args.scenario or "happy")
         label = args.scenario or "live"
+        fail_mode = os.environ.get("FAIL_MODE", "").strip().lower()
+        if fail_mode:
+            label = f"{label}-fail-{fail_mode}"
 
     session = Session()
     recorder = TranscriptRecorder(
@@ -111,23 +119,35 @@ def main() -> int:
         mode="live Messages API (claude-opus-5)" if args.live else "scripted (offline)",
     )
 
-    result = run_agent(
-        user_message=message, model=model, session=session, recorder=recorder
-    )
+    exit_code = 0
+    try:
+        result = run_agent(
+            user_message=message, model=model, session=session, recorder=recorder
+        )
+    except LoopError as exc:
+        # Loud, and still leaves a transcript behind for debugging.
+        exit_code = 1
+        recorder.note(f"**LOOP STOPPED ({exc.stop_reason}):** {exc}")
+        result = Result(
+            final_text=f"[no answer: {exc}]",
+            turns=exc.turns,
+            session=session,
+            stop_reason=exc.stop_reason or "error",
+        )
 
     out = pathlib.Path(args.out) if args.out else TRANSCRIPT_DIR / f"{label}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(recorder.render(result, session), encoding="utf-8")
 
     print(
-        f"[{label}] {result.turns} turns | "
+        f"[{label}] {result.turns} turns | stop={result.stop_reason} | "
         f"verified={session.verified_customer_id or 'no'} | "
         f"refunds={session.refunded_by_order or '{}'} | "
         f"tickets={[t['ticket_id'] for t in session.tickets] or '[]'} | "
         f"wrote {out}"
     )
     print("\n--- final reply ---\n" + (result.final_text or "(no text)"))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

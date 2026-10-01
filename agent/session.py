@@ -19,10 +19,10 @@ class Session:
     verified_customer_id: str | None = None
     verified_customer_name: str | None = None
 
-    # TODO (Task 4): the $500 ceiling has to hold across the whole conversation,
-    # not just one call. Track what has already been refunded per order here, and
-    # read it from your ceiling check. Without this, 2 x $450 walks straight past
-    # a $500 limit and your gate is decorative.
+    # Dollars refunded per order IN THIS SESSION, written only by a successful
+    # process_refund. The $500 ceiling reads this (plus the order's prior refunds),
+    # so it holds across the whole conversation: 2 x $450 is $900, not two $450s.
+    # This is the system of record for the ceiling, not anything in the transcript.
     refunded_by_order: dict[str, float] = field(default_factory=dict)
 
     # Escalation tickets raised in this session. Handed to a human who cannot see
@@ -36,6 +36,9 @@ class Session:
 
     # Lets the seeded transient failure fire once per session instead of forever.
     lookup_attempts: dict[str, int] = field(default_factory=dict)
+
+    # FAIL_MODE demo: which tools have already had their one injected failure.
+    injected_failures: set[str] = field(default_factory=set)
 
     # Every gate decision and tool call. Your transcripts and your tests both read
     # this, and in production it is what you would alert on.
