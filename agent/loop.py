@@ -156,8 +156,13 @@ def run_agent(
             # several user messages is its own bug: it teaches the model to stop
             # batching calls, which is exactly the behaviour multi-concern handling
             # depends on.
-            first = response.tool_uses[0]
-            results = [execute_tool(first, session, recorder)]
+            #first = response.tool_uses[0]
+            #results = [execute_tool(first, session, recorder)]
+            # Execute EVERY tool_use block, return ALL results in ONE user message.
+            results = [
+                execute_tool(block, session, recorder)
+                for block in response.tool_uses
+            ]
             messages.append({"role": "user", "content": results})
             if recorder:
                 recorder.tool_results_appended(len(results))
