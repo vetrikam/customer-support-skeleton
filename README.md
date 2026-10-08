@@ -326,3 +326,53 @@ Resolution Agent, Domains 1 (primary), 2 and 5.
 ## Licence
 
 MIT. See [LICENSE](LICENSE). Fork it, change it, keep your work.
+
+---
+
+## Assignment 2: Multi-Agent Support Ticket Coordinator
+
+A coordinator that splits one four-concern ticket across four specialist subagents, checks coverage against the ticket, and reports each concern as handled, escalated, or unresolved. Full detail, including what is offline and what is live, is in [MULTI_AGENT.md](MULTI_AGENT.md).
+
+Run it:
+
+```bash
+python run_multi.py                              # offline demo, writes transcripts/multi-agent.md
+python run_live.py --scenario ticket             # live, four concerns
+python run_live.py --scenario ceiling            # live, $899 refund; the hook denies it
+python run_single.py --scenario ticket --compare transcripts/live-ticket.md   # single-agent baseline
+python -m unittest discover -s tests -t .        # 39 tests
+```
+
+### Reflection
+
+**1. Every subagent reported success, but a concern was still missing. Where do you look first, and why isn't it the subagents?**
+
+I look at the coordinator's decomposition first, and I check it against the ticket, not against the coordinator's own plan. Each subagent can only report on the work it was given. If it finishes its task cleanly, that tells you nothing about the concerns nobody gave it.
+
+In my offline run, the coordinator's first prompt sent the kettle refund and the return-window question to specialists and left out the duplicate charge and the chargeback threat. Both specialists succeeded. The gap only showed when I listed the four concerns from the ticket and compared them to the assignments. The fix went in the coordinator prompt: list every concern first, then delegate. I did not change the subagents.
+
+**2. Roughly how many more tokens did the system use, and was the ticket worth it?**
+
+On this ticket, the multi-agent run cost about 3 times as much as the single agent: $0.30 against $0.10. The token count was only about 1.2 times higher. That gap probably means the token totals leave out the subagents' usage, so I used cost as the fairer comparison.
+
+Was it worth it? For this ticket, the single agent did most of the work at a third of the cost. It also merged two concerns: it filed the duplicate charge and the chargeback threat as one escalation, under C2. The multi-agent run kept four separate concerns with their own IDs, sources, and escalation records. That separation is what the extra cost buys, and it matters most when concerns have different deadlines or owners. It would not be worth it for a ticket with one concern, such as the kettle refund alone. There, coordination costs more than it saves.
+
+This comparison rests on one run of each approach, and model output varies.
+
+**3. What did you have to put in a subagent's prompt that you initially assumed it would already have?**
+
+Several things, each of which I first assumed the subagent would know:
+
+- **The customer ID format.** The subagents needed `CUST-001`, not the email address. In an early live run, a subagent passed the email address as `customer_id`, and the call failed.
+- **The refund amount.** The refund processor declined to refund the kettle because the amount wasn't in its prompt. I had assumed it could work out the price from the order. It needed the order total stated, and a rule for when that total is the refund amount.
+- **The concern ID.** The escalation writer labeled the chargeback ticket C1, not C4, because the coordinator never sent it the ID. The ticket was filed under the wrong concern until I fixed the prompt.
+- **The order status.** In my offline test, the return-window analyst gave a hedged answer, "probably applies, but I cannot confirm it," until its prompt included the order's status. It couldn't know the status from the policy alone.
+- **The order of work.** The chargeback escalation needed the confirmed duplicate amount from the investigation. Until the coordinator was told to wait for that result, the escalation ran in parallel and recorded $0.
+
+Each of these was a fact the coordinator knew but never passed on. A subagent starts with nothing, so every fact it needs has to be in its prompt.
+
+### Known limitations
+
+- The refund processor takes the customer ID from the order record and does not check that the person asking owns the order. Identity checking was Assignment 1's job and is not repeated here.
+- The escalation tool only creates tickets. It cannot update or relabel one, so a wrong concern ID has to be corrected by a person.
+- Each comparison is one run per approach. Treat the cost figures as a single data point.
